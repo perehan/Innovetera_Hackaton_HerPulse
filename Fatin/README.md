@@ -9,5 +9,5 @@ The model is trained on high-quality cardiovascular datasets to identify risk pa
 ## Contents
 
 * Training scripts
-* Trained model
-* Evaluation results
+* MainPipeline for end-to-end model execution and prediction
+* API integration for communication with the mobile application
