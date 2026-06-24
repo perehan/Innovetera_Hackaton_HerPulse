@@ -1,14 +1,4 @@
-// ============================================================
-//  CVD Early Warning Patch — ESP32 + 16x2 LCD (I2C)
-//  Sensors: MAX30102 (HR+SpO2), DS18B20 (Temp), MPU6050 (Motion)
-//  Display: 16x2 LCD via I2C (address 0x27)
-//  Output:  CSV via Serial → Python AI pipeline
-//  Wiring:
-//    LCD SDA → GPIO 21
-//    LCD SCL → GPIO 22
-//    LCD VCC → 5V
-//    LCD GND → GND
-// ============================================================
+
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -17,16 +7,14 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-// ── LCD Setup ────────────────────────────────────────────────
-// If screen is blank, try address 0x3F instead of 0x27
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ── Pin Definitions ─────────────────────────────────────────
+// ── Pin Definitions 
 #define ONE_WIRE_BUS  4
 #define I2C_SDA      21
 #define I2C_SCL      22
 
-// ── MAX30102 Registers ───────────────────────────────────────
+// ── MAX30102 Registers 
 #define MAX30102_ADDR 0x57
 #define FIFO_DATA     0x07
 #define MODE_CONFIG   0x09
@@ -36,7 +24,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 #define FIFO_WR_PTR   0x04
 #define FIFO_RD_PTR   0x06
 
-// ── MAX30102 Buffers ─────────────────────────────────────────
+// ── MAX30102 Buffers
 #define BUFFER_SIZE 50
 uint32_t redBuffer[BUFFER_SIZE];
 uint32_t irBuffer[BUFFER_SIZE];
@@ -48,33 +36,33 @@ int      heartRate      = 0;
 int      spo2           = 0;
 bool     fingerDetected = false;
 
-// ── USER HEALTH CONTEXT ──────────────────────────────────────
+// ── USER HEALTH CONTEXT
 // cycle_phase: 0=Follicular 1=Ovulation 2=Luteal 3=Menstrual
 int   CYCLE_PHASE  = 0;
 int   IS_PREGNANT  = 0;
 int   MENOPAUSAL   = 0;
 float USER_AGE     = 30.0;
 
-// ── Objects ──────────────────────────────────────────────────
+// ── Objects 
 Adafruit_MPU6050  mpu;
 OneWire           oneWire(ONE_WIRE_BUS);
 DallasTemperature tempSensor(&oneWire);
 
-// ── Timing ───────────────────────────────────────────────────
+// ── Timing
 unsigned long lastSendTime  = 0;
 unsigned long lastLCDSwitch = 0;
 int           lcdPage       = 0;   // cycles through display pages
 const unsigned long SEND_INTERVAL = 2000;
 const unsigned long LCD_INTERVAL  = 3000;  // switch page every 3s
 
-// ── Last readings (for LCD) ──────────────────────────────────
+// ── Last readings (for LCD) 
 float lastHR     = 0;
 float lastSpO2   = 0;
 float lastTemp   = 0;
 float lastMotion = 0;
 String lastStatus = "Waiting...";
 
-// ── MAX30102 Functions ───────────────────────────────────────
+// ── MAX30102 Functions 
 void writeReg(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(MAX30102_ADDR);
   Wire.write(reg); Wire.write(val);
@@ -141,9 +129,7 @@ void readMAX30102() {
   if (++bufferIndex >= BUFFER_SIZE) { bufferIndex = 0; calculateSpO2(); }
 }
 
-// ── LCD Display Pages ────────────────────────────────────────
-// 16x2 = 16 characters per row, 2 rows
-// We cycle through 3 pages every 3 seconds
+// ── LCD Display Pages
 
 void updateLCD() {
   lcd.clear();
@@ -220,14 +206,14 @@ void updateLCD() {
   }
 }
 
-// ── Determine status from readings ───────────────────────────
+// ── Determine status from readings
 String getStatus(float hr, float spo2, float temp) {
   if (hr > 120 || spo2 < 92 || temp > 38.5) return "High Risk";
   if (hr > 100 || spo2 < 95 || temp > 37.5) return "Elevated";
   return "Normal";
 }
 
-// ── Setup ────────────────────────────────────────────────────
+// ── Setup 
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -270,7 +256,7 @@ void setup() {
   Serial.println("READY");
 }
 
-// ── Loop ─────────────────────────────────────────────────────
+// ── Loop 
 void loop() {
   // Always poll MAX30102 for accurate HR
   readMAX30102();
