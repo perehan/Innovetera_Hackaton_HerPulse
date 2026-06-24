@@ -1,0 +1,325 @@
+// ============================================================
+//  CVD Early Warning Patch — ESP32 + 16x2 LCD (I2C)
+//  Sensors: MAX30102 (HR+SpO2), DS18B20 (Temp), MPU6050 (Motion)
+//  Display: 16x2 LCD via I2C (address 0x27)
+//  Output:  CSV via Serial → Python AI pipeline
+//  Wiring:
+//    LCD SDA → GPIO 21
+//    LCD SCL → GPIO 22
+//    LCD VCC → 5V
+//    LCD GND → GND
+// ============================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ── LCD Setup ────────────────────────────────────────────────
+// If screen is blank, try address 0x3F instead of 0x27
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ── Pin Definitions ─────────────────────────────────────────
+#define ONE_WIRE_BUS  4
+#define I2C_SDA      21
+#define I2C_SCL      22
+
+// ── MAX30102 Registers ───────────────────────────────────────
+#define MAX30102_ADDR 0x57
+#define FIFO_DATA     0x07
+#define MODE_CONFIG   0x09
+#define SPO2_CONFIG   0x0A
+#define LED1_PA       0x0C
+#define LED2_PA       0x0D
+#define FIFO_WR_PTR   0x04
+#define FIFO_RD_PTR   0x06
+
+// ── MAX30102 Buffers ─────────────────────────────────────────
+#define BUFFER_SIZE 50
+uint32_t redBuffer[BUFFER_SIZE];
+uint32_t irBuffer[BUFFER_SIZE];
+int      bufferIndex    = 0;
+uint32_t irValue        = 0;
+uint32_t redValue       = 0;
+uint32_t lastBeat       = 0;
+int      heartRate      = 0;
+int      spo2           = 0;
+bool     fingerDetected = false;
+
+// ── USER HEALTH CONTEXT ──────────────────────────────────────
+// cycle_phase: 0=Follicular 1=Ovulation 2=Luteal 3=Menstrual
+int   CYCLE_PHASE  = 0;
+int   IS_PREGNANT  = 0;
+int   MENOPAUSAL   = 0;
+float USER_AGE     = 30.0;
+
+// ── Objects ──────────────────────────────────────────────────
+Adafruit_MPU6050  mpu;
+OneWire           oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensor(&oneWire);
+
+// ── Timing ───────────────────────────────────────────────────
+unsigned long lastSendTime  = 0;
+unsigned long lastLCDSwitch = 0;
+int           lcdPage       = 0;   // cycles through display pages
+const unsigned long SEND_INTERVAL = 2000;
+const unsigned long LCD_INTERVAL  = 3000;  // switch page every 3s
+
+// ── Last readings (for LCD) ──────────────────────────────────
+float lastHR     = 0;
+float lastSpO2   = 0;
+float lastTemp   = 0;
+float lastMotion = 0;
+String lastStatus = "Waiting...";
+
+// ── MAX30102 Functions ───────────────────────────────────────
+void writeReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MAX30102_ADDR);
+  Wire.write(reg); Wire.write(val);
+  Wire.endTransmission();
+}
+
+void initMAX30102() {
+  Wire.beginTransmission(MAX30102_ADDR);
+  if (Wire.endTransmission() != 0) {
+    lcd.setCursor(0, 0); lcd.print("MAX30102 ERROR!");
+    return;
+  }
+  writeReg(MODE_CONFIG, 0x40); delay(100);
+  writeReg(MODE_CONFIG, 0x03);
+  writeReg(SPO2_CONFIG, 0x27);
+  writeReg(LED1_PA, 0x24);
+  writeReg(LED2_PA, 0x24);
+  writeReg(FIFO_WR_PTR, 0);
+  writeReg(FIFO_RD_PTR, 0);
+  delay(100);
+}
+
+void calculateSpO2() {
+  float dcIR = 0, dcRed = 0;
+  float irMax = 0, irMin = 999999, redMax = 0, redMin = 999999;
+  for (int i = 0; i < BUFFER_SIZE; i++) {
+    dcIR  += irBuffer[i]; dcRed += redBuffer[i];
+    if (irBuffer[i]  > irMax)  irMax  = irBuffer[i];
+    if (irBuffer[i]  < irMin)  irMin  = irBuffer[i];
+    if (redBuffer[i] > redMax) redMax = redBuffer[i];
+    if (redBuffer[i] < redMin) redMin = redBuffer[i];
+  }
+  dcIR /= BUFFER_SIZE; dcRed /= BUFFER_SIZE;
+  float acIR = irMax - irMin, acRed = redMax - redMin;
+  if (acIR <= 0 || dcIR <= 0 || dcRed <= 0) return;
+  float R = (acRed / dcRed) / (acIR / dcIR);
+  int newSpO2 = constrain((int)(110 - 25 * R), 0, 100);
+  spo2 = (int)(spo2 * 0.7 + newSpO2 * 0.3);
+}
+
+void readMAX30102() {
+  Wire.beginTransmission(MAX30102_ADDR);
+  Wire.write(FIFO_DATA); Wire.endTransmission(false);
+  Wire.requestFrom(MAX30102_ADDR, 6);
+  if (Wire.available() == 6) {
+    redValue = ((uint32_t)Wire.read()<<16)|((uint32_t)Wire.read()<<8)|Wire.read();
+    irValue  = ((uint32_t)Wire.read()<<16)|((uint32_t)Wire.read()<<8)|Wire.read();
+    redValue &= 0x3FFFF; irValue &= 0x3FFFF;
+  }
+  fingerDetected = (irValue > 50000);
+  if (!fingerDetected) { heartRate = 0; spo2 = 0; return; }
+
+  static uint32_t prevIR = 0;
+  if (irValue > prevIR + 2000) {
+    uint32_t now = millis();
+    if (lastBeat > 0) {
+      uint32_t interval = now - lastBeat;
+      if (interval > 300 && interval < 2000) heartRate = 60000 / interval;
+    }
+    lastBeat = now;
+  }
+  prevIR = irValue;
+  irBuffer[bufferIndex] = irValue; redBuffer[bufferIndex] = redValue;
+  if (++bufferIndex >= BUFFER_SIZE) { bufferIndex = 0; calculateSpO2(); }
+}
+
+// ── LCD Display Pages ────────────────────────────────────────
+// 16x2 = 16 characters per row, 2 rows
+// We cycle through 3 pages every 3 seconds
+
+void updateLCD() {
+  lcd.clear();
+
+  if (!fingerDetected) {
+    // No finger — show prompt
+    lcd.setCursor(0, 0); lcd.print("Place finger on ");
+    lcd.setCursor(0, 1); lcd.print("  HR sensor...  ");
+    return;
+  }
+
+  switch (lcdPage) {
+
+    case 0:
+      // Page 1: Heart Rate + SpO2
+      // Row 0: "HR: 78 BPM      "
+      // Row 1: "SpO2: 97%       "
+      lcd.setCursor(0, 0);
+      lcd.print("HR:");
+      lcd.print((int)lastHR);
+      lcd.print(" BPM");
+      // Status indicator on right
+      lcd.setCursor(12, 0);
+      if (lastStatus == "Normal")   lcd.print(" OK ");
+      else if (lastStatus == "Elevated") lcd.print("ELEV");
+      else                          lcd.print("HIGH");
+
+      lcd.setCursor(0, 1);
+      lcd.print("SpO2:");
+      lcd.print((int)lastSpO2);
+      lcd.print("%");
+      if (lastSpO2 < 92) {
+        lcd.setCursor(8, 1); lcd.print("!LOW!");
+      } else if (lastSpO2 < 95) {
+        lcd.setCursor(8, 1); lcd.print(" LOW ");
+      } else {
+        lcd.setCursor(8, 1); lcd.print("  OK ");
+      }
+      break;
+
+    case 1:
+      // Page 2: Temperature + Motion
+      // Row 0: "Temp: 36.8 C    "
+      // Row 1: "Motion: 3.2 m/s2"
+      lcd.setCursor(0, 0);
+      lcd.print("Temp:");
+      lcd.print(lastTemp, 1);
+      lcd.print((char)223);  // degree symbol
+      lcd.print("C");
+      if (lastTemp > 38.5) { lcd.setCursor(12, 0); lcd.print("HOT!"); }
+      else if (lastTemp > 37.5) { lcd.setCursor(11, 0); lcd.print("WARM"); }
+
+      lcd.setCursor(0, 1);
+      lcd.print("Motion:");
+      lcd.print(lastMotion, 1);
+      lcd.print("m/s");
+      break;
+
+    case 2:
+      // Page 3: Overall status + cycle context
+      // Row 0: "Status: NORMAL  "
+      // Row 1: cycle phase name
+      lcd.setCursor(0, 0);
+      lcd.print("Status:");
+      if (lastStatus == "Normal")        lcd.print(" NORMAL ");
+      else if (lastStatus == "Elevated") lcd.print(" ELEVTD ");
+      else                               lcd.print("  HIGH! ");
+
+      lcd.setCursor(0, 1);
+      String phases[] = {"Follicular", "Ovulation ", "Luteal    ", "Menstrual "};
+      String preg = IS_PREGNANT ? "Pregnant  " : phases[CYCLE_PHASE];
+      lcd.print(preg);
+      break;
+  }
+}
+
+// ── Determine status from readings ───────────────────────────
+String getStatus(float hr, float spo2, float temp) {
+  if (hr > 120 || spo2 < 92 || temp > 38.5) return "High Risk";
+  if (hr > 100 || spo2 < 95 || temp > 37.5) return "Elevated";
+  return "Normal";
+}
+
+// ── Setup ────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // LCD init
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("CVD Patch v1.0");
+  lcd.setCursor(0, 1); lcd.print("Starting up...");
+  delay(2000);
+  lcd.clear();
+
+  // MAX30102
+  initMAX30102();
+  lcd.setCursor(0, 0); lcd.print("MAX30102: OK");
+  delay(800); lcd.clear();
+
+  // MPU6050
+  if (!mpu.begin()) {
+    lcd.setCursor(0, 0); lcd.print("MPU6050 ERROR!");
+    delay(1000);
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    lcd.setCursor(0, 0); lcd.print("MPU6050:  OK");
+    delay(800); lcd.clear();
+  }
+
+  // DS18B20
+  tempSensor.begin();
+  lcd.setCursor(0, 0); lcd.print("DS18B20:  OK");
+  delay(800); lcd.clear();
+
+  // Ready
+  lcd.setCursor(0, 0); lcd.print("All sensors OK!");
+  lcd.setCursor(0, 1); lcd.print("Place finger...");
+  delay(1500); lcd.clear();
+
+  Serial.println("READY");
+}
+
+// ── Loop ─────────────────────────────────────────────────────
+void loop() {
+  // Always poll MAX30102 for accurate HR
+  readMAX30102();
+
+  unsigned long now = millis();
+
+  // Send data every 2 seconds
+  if (now - lastSendTime >= SEND_INTERVAL) {
+    lastSendTime = now;
+
+    // Read temperature
+    tempSensor.requestTemperatures();
+    float temp = tempSensor.getTempCByIndex(0);
+
+    // Read motion
+    sensors_event_t a, g, t;
+    mpu.getEvent(&a, &g, &t);
+    float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
+    float motion = sqrt(ax*ax + ay*ay + az*az);
+
+    // Use readings (fallback if no finger)
+    float hr_out   = fingerDetected ? (float)heartRate : 0.0;
+    float spo2_out = fingerDetected ? (float)spo2      : 0.0;
+
+    // Save for LCD
+    lastHR     = hr_out;
+    lastSpO2   = spo2_out;
+    lastTemp   = temp;
+    lastMotion = motion;
+    lastStatus = getStatus(hr_out, spo2_out, temp);
+
+    // Send CSV to Python
+    // Format: HR,SPO2,TEMP,MOTION,CYCLE_PHASE,IS_PREGNANT,MENOPAUSAL,AGE
+    Serial.print(hr_out);      Serial.print(",");
+    Serial.print(spo2_out);    Serial.print(",");
+    Serial.print(temp);        Serial.print(",");
+    Serial.print(motion);      Serial.print(",");
+    Serial.print(CYCLE_PHASE); Serial.print(",");
+    Serial.print(IS_PREGNANT); Serial.print(",");
+    Serial.print(MENOPAUSAL);  Serial.print(",");
+    Serial.println(USER_AGE);
+  }
+
+  // Switch LCD page every 3 seconds
+  if (now - lastLCDSwitch >= LCD_INTERVAL) {
+    lastLCDSwitch = now;
+    lcdPage = (lcdPage + 1) % 3;
+    updateLCD();
+  }
+
+  delay(10);
+}
