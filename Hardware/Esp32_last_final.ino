@@ -1,15 +1,3 @@
-// ============================================================
-//  CVD Early Warning Patch — ESP32 + 16x2 LCD (I2C)
-//  Sensors: MAX30102 (HR+SpO2), DS18B20 (Temp), MPU6050 (Motion)
-//  Display: 16x2 LCD via I2C (address 0x27)
-//  Output:  CSV via Serial → Python AI pipeline
-//  Wiring:
-//    LCD SDA → GPIO 21
-//    LCD SCL → GPIO 22
-//    LCD VCC → 5V
-//    LCD GND → GND
-// ============================================================
-
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Adafruit_MPU6050.h>
